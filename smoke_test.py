@@ -29,6 +29,13 @@ check("seed note on #7", r["lines"][6]["note"] is not None
       and "停两拍" in r["lines"][6]["note"]["content"])
 seed_ids = [l["id"] for l in r["lines"]]
 
+# 角色确认：示例三个角色在 r1 均已确认（随 r1 一起播种）
+r = client.get("/api/confirmations").get_json()
+check("seed all confirmed at r1",
+      [(c["character"], c["status"]) for c in r["confirmations"]] ==
+      [("林晚", "confirmed"), ("老周", "confirmed"), ("阿禾", "confirmed")]
+      and all(c["confirmedRevision"] == 1 for c in r["confirmations"]), r)
+
 # 角色页
 r = client.get("/api/characters/林晚").get_json()
 check("role page revision", r["revision"] == 1)
@@ -36,6 +43,9 @@ check("role only own lines", all(e is not None for e in r["entries"])
       and len(r["entries"]) == 3)
 check("role cue previous speaker", r["entries"][0]["cue"] is None
       and r["entries"][1]["cue"]["character"] == "阿禾")
+check("role page carries confirmation",
+      r["confirmation"]["status"] == "confirmed"
+      and r["confirmation"]["confirmedRevision"] == 1, r["confirmation"])
 check("missing role 404", client.get("/api/characters/路人").status_code == 404)
 
 # 已发布 r1
@@ -68,6 +78,36 @@ check("note still on #7", r["lines"][6]["note"] is not None)
 # r1 发布版不受影响
 r = client.get("/api/publications/1").get_json()
 check("pub r1 unaffected", "一盏马灯" in r["lines"][0]["text"])
+
+# 确认状态：改了林晚的第一句 -> 林晚（正文变）、老周（#2 的紧前提示变）待确认，
+# 阿禾所见内容完全不受影响，仍是已确认
+r = client.get("/api/confirmations").get_json()
+st = {c["character"]: c["status"] for c in r["confirmations"]}
+check("text edit: 林晚 pending", st["林晚"] == "pending", st)
+check("text edit: 老周 cue pending", st["老周"] == "pending", st)
+check("text edit: 阿禾 stays confirmed", st["阿禾"] == "confirmed", st)
+# 待确认角色带回确认时所见快照（旧正文），已确认角色不带快照
+lin = [c for c in r["confirmations"] if c["character"] == "林晚"][0]
+check("pending snapshot has old content",
+      lin["snapshot"] is not None and "提着一盏马灯" in lin["snapshot"][0]["text"]
+      and lin["confirmedRevision"] == 1, lin)
+ahe = [c for c in r["confirmations"] if c["character"] == "阿禾"][0]
+check("confirmed snapshot omitted", ahe["snapshot"] is None)
+# 过期修订确认被拒；角色不存在 404；缺 revision 400
+check("stale confirm -> 409",
+      client.post("/api/characters/林晚/confirmations", json={"revision": 1}).status_code == 409)
+check("confirm unknown character -> 404",
+      client.post("/api/characters/路人/confirmations", json={"revision": 2}).status_code == 404)
+check("confirm without revision -> 400",
+      client.post("/api/characters/林晚/confirmations", json={}).status_code == 400)
+# 按当前修订确认 -> 201，且确认本身不推进修订号
+resp = client.post("/api/characters/林晚/confirmations", json={"revision": 2})
+check("confirm 201", resp.status_code == 201, resp.get_json())
+check("confirm does not bump revision",
+      client.get("/api/draft").get_json()["revision"] == 2)
+# 再确认一次阿禾（内容没变，属于重复确认同样允许）
+check("re-confirm unchanged role 201",
+      client.post("/api/characters/阿禾/confirmations", json={"revision": 2}).status_code == 201)
 
 # 4. 删除带笔记的台词 -> 整次拒绝 422，指出笔记
 resp = client.post("/api/draft", json={"revision": 2, "ops": [
@@ -174,7 +214,39 @@ resp = client.post("/api/draft", json={"revision": 7, "ops": [
 check("delete after note cleared 200", resp.status_code == 200, resp.get_json())
 check("rev -> 8", resp.get_json()["revision"] == 8)
 
-# 9. 发布 r2（当前修订 8）；之后再改工作稿，r2 不变
+# 9. 发布闸门：有待确认角色 -> 422 整次拒绝，且不留下任何（部分）发布版
+r = client.get("/api/confirmations").get_json()
+pending_now = {c["character"] for c in r["confirmations"] if c["status"] != "confirmed"}
+check("four current characters at rev8",
+      pending_now == {"旁白", "林晚", "老周", "阿禾"}, pending_now)
+resp = client.post("/api/publications", json={"revision": 8, "label": "不该出现的版本"})
+check("publish with pending -> 422", resp.status_code == 422, resp.status_code)
+check("publish rejection lists characters",
+      set(resp.get_json()["pendingCharacters"]) == pending_now, resp.get_json())
+check("rejected publish leaves no snapshot",
+      [p["revision"] for p in client.get("/api/publications").get_json()["publications"]] == [1])
+
+# 逐个确认当前四个角色（确认不推进修订）；缺一个仍不能发布
+for name in ["林晚", "老周", "阿禾"]:
+    check(f"confirm {name} at rev8",
+          client.post(f"/api/characters/{name}/confirmations",
+                      json={"revision": 8}).status_code == 201)
+resp = client.post("/api/publications", json={"revision": 8})
+check("publish still blocked with one pending", resp.status_code == 422)
+check("last pending character named",
+      resp.get_json()["pendingCharacters"] == ["旁白"], resp.get_json())
+check("confirm still no revision bump",
+      client.get("/api/draft").get_json()["revision"] == 8)
+check("confirm last character 旁白",
+      client.post("/api/characters/旁白/confirmations", json={"revision": 8}).status_code == 201)
+
+# 记录 r8 确认时阿禾 / 老周各句的紧前提示，供后续「无关改动」隔离比对
+def cues_of(name):
+    return [(e["lineId"], e["cue"]["id"] if e["cue"] else None)
+            for e in client.get(f"/api/characters/{name}").get_json()["entries"]]
+cues_at_rev8 = {"阿禾": cues_of("阿禾"), "老周": cues_of("老周")}
+
+# 发布 r8（当前修订 8）；之后再改工作稿，r8 不变
 pub = client.post("/api/publications", json={"revision": 8, "label": "联排版"}).get_json()
 check("publish r8", pub["revision"] == 8)
 check("duplicate publish 422",
@@ -202,12 +274,109 @@ r = client.get("/api/publications/1/characters/林晚").get_json()
 check("pub role page frozen notes",
       any(e["lineId"] == seed_ids[6] and e["note"] for e in r["entries"]))
 
+# 无关改动不影响已确认：新增的收场白属于旁白，只有旁白的角色页多了一句
+# （确认时它不存在）；其余角色所见完全不变，仍保持已确认
+r = client.get("/api/confirmations").get_json()
+st = {c["character"]: c["status"] for c in r["confirmations"]}
+check("isolation: only line-owner role pending",
+      st == {"旁白": "pending", "林晚": "confirmed", "老周": "confirmed",
+             "阿禾": "confirmed"}, st)
+# 角色页：新句在当前页里，但确认时快照中没有它（新增可见台词）
+r = client.get("/api/characters/旁白").get_json()
+check("new line visible now", any(e["lineId"] == id_after for e in r["entries"]))
+check("new line absent from confirmed snapshot",
+      all(s["lineId"] != id_after for s in r["confirmation"]["snapshot"]))
+check("old line #1 still in snapshot as before",
+      any(s["lineId"] == seed_ids[0] and s["cue"] is None
+          for s in r["confirmation"]["snapshot"]))
+check("confirm endpoint stale after new edit still 409",
+      client.post("/api/characters/旁白/confirmations", json={"revision": 8}).status_code == 409)
+
+# 确认状态持久化：重新 init_db（容器重启等价）后确认记录仍在（此时仍处 r9）
+appmod.init_db()
+r = client.get("/api/confirmations").get_json()
+st = {c["character"]: c["status"] for c in r["confirmations"]}
+check("confirmations survive restart",
+      st == {"旁白": "pending", "林晚": "confirmed", "老周": "confirmed",
+             "阿禾": "confirmed"}, st)
+r = client.get("/api/publications").get_json()
+check("pubs survive restart", [p["revision"] for p in r["publications"]] == [1, 8])
+
+# 紧前提示隔离：旁白在 r9 重新确认，随后在开头插入一句新开场白（add + reorder，
+# 与前端算法一致）-> 旁白第一句 #1 原本开场、紧前提示变为新句，待确认；
+# 新句属于林晚，林晚也待确认；阿禾第一句 #3 的紧前提示始终是 #1，老周第一句
+# 紧前提示始终是 #4，两人所见内容均未变化，保持已确认
+check("confirm 旁白 at rev9",
+      client.post("/api/characters/旁白/confirmations", json={"revision": 9}).status_code == 201)
+resp = client.post("/api/draft", json={"revision": 9, "ops": [
+    {"cid": "open1", "type": "add", "character": "林晚", "text": "新的开场白",
+     "anchor": None},
+    {"cid": "open2", "type": "reorder", "target": {"type": "new", "cid": "open1"},
+     "anchor": None},
+]})
+check("insert top add+reorder 200", resp.status_code == 200, resp.get_json())
+id_open = resp.get_json()["newIds"]["open1"]
+r = client.get("/api/draft").get_json()
+check("new opening is first", r["lines"][0]["id"] == id_open, r["lines"][0])
+st = {c["character"]: c["status"] for c in
+      client.get("/api/confirmations").get_json()["confirmations"]}
+check("cue isolation: only 旁白/林晚 pending",
+      st == {"旁白": "pending", "林晚": "pending", "老周": "confirmed",
+             "阿禾": "confirmed"}, st)
+# 旁白角色页明确标出 #1 的紧前提示从「无」变成新开场白
+r = client.get("/api/characters/旁白").get_json()
+e1 = next(e for e in r["entries"] if e["lineId"] == seed_ids[0])
+check("旁白 #1 cue now the new opening", e1["cue"] is not None
+      and e1["cue"]["id"] == id_open, e1)
+s1 = next(s for s in r["confirmation"]["snapshot"] if s["lineId"] == seed_ids[0])
+check("旁白 #1 snapshot cue was None", s1["cue"] is None)
+# 阿禾、老周在 r10 仍已确认：记录 r8 确认后他们各句的紧前提示，开头插句后逐一比对不变
+for who in ("阿禾", "老周"):
+    r = client.get(f"/api/characters/{who}").get_json()
+    check(f"{who} confirmed after top insert",
+          r["confirmation"]["status"] == "confirmed", who)
+    cues_now = [(e["lineId"], e["cue"]["id"] if e["cue"] else None) for e in r["entries"]]
+    check(f"{who} cues unchanged by top insert", cues_now == cues_at_rev8[who],
+          (cues_now, cues_at_rev8[who]))
+
 # 10. 列表汇总
 r = client.get("/api/publications").get_json()
 check("pub list r1,r8", [p["revision"] for p in r["publications"]] == [1, 8])
-check("working rev 9", r["workingRevision"] == 9)
+check("working rev 10", r["workingRevision"] == 10)
 
-# 11. 健康检查与首页
+# 11. 没有台词：确认清单为空，全员（零角色）视为可发布；旧版仍可打开
+# 逐条删光工作稿（走到这里已无笔记；若有则先按原修订规则清空笔记）
+while True:
+    d = client.get("/api/draft").get_json()
+    if not d["lines"]:
+        break
+    nr, lid, owner = d["revision"], d["lines"][0]["id"], d["lines"][0]["character"]
+    first_entry = client.get(f"/api/characters/{owner}").get_json()["entries"][0]
+    if first_entry["lineId"] == lid and first_entry["note"]:
+        client.put(f"/api/lines/{lid}/note",
+                   json={"revision": nr, "character": owner, "content": ""})
+        nr += 1
+    resp = client.post("/api/draft", json={"revision": nr, "ops": [
+        {"cid": "emp", "type": "delete", "target": {"type": "line", "id": lid}}]})
+    check("drain delete ok", resp.status_code == 200, (lid, resp.status_code, resp.get_json()))
+r = client.get("/api/confirmations").get_json()
+check("empty script: confirmation list empty", r["confirmations"] == [], r)
+final_rev = client.get("/api/draft").get_json()["revision"]
+check("empty role page 404", client.get("/api/characters/林晚").status_code == 404)
+check("empty confirm unknown -> 404",
+      client.post("/api/characters/林晚/confirmations",
+                  json={"revision": final_rev}).status_code == 404)
+resp = client.post("/api/publications", json={"revision": final_rev, "label": "空场"})
+check("publish empty script allowed (no pending characters)",
+      resp.status_code == 201, (resp.status_code, resp.get_json()))
+check("empty publication snapshots zero lines",
+      client.get(f"/api/publications/{final_rev}").get_json()["lines"] == [])
+# 旧发布版仍然可打开
+check("old publications still open after empty",
+      [p["revision"] for p in client.get("/api/publications").get_json()["publications"]]
+      == [1, 8, final_rev])
+
+# 12. 健康检查与首页
 check("healthz", client.get("/healthz").data == b"ok")
 check("index served", b"app.js" in client.get("/").data)
 check("spa fallback serves index",

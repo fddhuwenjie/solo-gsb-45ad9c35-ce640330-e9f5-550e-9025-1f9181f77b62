@@ -5,9 +5,13 @@
 - 每次修改工作稿（增删 / 改派 / 改词 / 重排）或保存笔记，工作稿修订号 +1。
 - 修改必须附带「所见修订号」，过期则整次拒绝。
 - 删除或改派仍带笔记的台词，整次拒绝并指出需先处理的笔记。
-- 发布时把所有角色页与笔记冻结进同一修订，旧版始终可打开。
+- 角色可对自己角色页所见内容（台词编号与顺序、正文、紧前提示、笔记）确认；
+  确认只覆盖该角色当时可见的内容，其他角色的无关改动不影响已确认状态。
+- 发布时把所有角色页与笔记冻结进同一修订，旧版始终可打开；
+  发布在同一数据库状态下核对修订与全部当前角色的确认状态，有待确认角色则整次拒绝。
 """
 
+import json
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -55,6 +59,7 @@ def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     first = not os.path.exists(DB_PATH)
     conn = sqlite3.connect(DB_PATH, isolation_level=None)
+    conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA foreign_keys = ON")
@@ -106,6 +111,16 @@ def init_db():
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (revision, line_id)
             );
+
+            -- 角色确认：确认时把该角色页所见内容（台词编号与顺序、正文、紧前提示、
+            -- 笔记）快照下来；之后只有这些可见内容发生变化才转为待确认。
+            -- 按角色名存一行；角色不再有台词时该行只是不再出现在确认清单中。
+            CREATE TABLE IF NOT EXISTS confirmation (
+                character     TEXT PRIMARY KEY,
+                revision      INTEGER NOT NULL,   -- 确认时所见的工作稿修订号
+                confirmed_at  TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL
+            );
             """
         )
         if first:
@@ -142,6 +157,14 @@ def _seed(conn):
             "SELECT 1, n.line_id, l.character, n.content, n.updated_at "
             "FROM note n JOIN line l ON l.id = n.line_id"
         )
+        # 示例工作稿发布为 r1：三个角色对自己角色页所见内容（r1）均已确认
+        for char in SEED_CHARACTERS:
+            conn.execute(
+                "INSERT INTO confirmation (character, revision, confirmed_at, snapshot_json) "
+                "VALUES (?, 1, ?, ?)",
+                (char, now, json.dumps(character_fingerprint(conn, char),
+                                       ensure_ascii=False)),
+            )
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
@@ -222,6 +245,93 @@ def publications_payload(conn):
             "noteCount": notes,
         })
     return out
+
+
+# --------------------------------------------------------------------------- #
+# 角色确认
+# --------------------------------------------------------------------------- #
+def character_entries(conn, name):
+    """某角色当前在工作稿中所见的角色页内容（台词编号与顺序、正文、紧前提示、笔记）。
+
+    与 GET /api/characters/<name> 返回的 entries 完全一致；角色没有台词时返回 None。
+    """
+    rows = conn.execute(
+        "SELECT id, text, pos FROM line WHERE character = ? ORDER BY pos", (name,)
+    ).fetchall()
+    if not rows:
+        return None
+    entries = []
+    for r in rows:
+        cue = conn.execute(
+            "SELECT id, character, text FROM line WHERE pos < ? ORDER BY pos DESC LIMIT 1",
+            (r["pos"],),
+        ).fetchone()
+        note = conn.execute(
+            "SELECT content, updated_at FROM note WHERE line_id = ?", (r["id"],)
+        ).fetchone()
+        entries.append({
+            "lineId": r["id"],
+            "text": r["text"],
+            "cue": dict(cue) if cue else None,
+            "note": {"content": note["content"], "updatedAt": note["updated_at"]}
+                    if note else None,
+        })
+    return entries
+
+
+def character_fingerprint(conn, name):
+    """角色页所见内容的可比快照：台词编号与顺序 + 正文 + 紧前提示 + 笔记。
+
+    只包含角色页实际可见的字段（笔记只比对正文，不含更新时间——更新时间不是
+    页面要确认的「内容」）；其他角色的台词若不充当紧前提示，完全不在快照内。
+    """
+    entries = character_entries(conn, name)
+    if entries is None:
+        return None
+    return [{
+        "lineId": e["lineId"],
+        "text": e["text"],
+        "cue": ({"id": e["cue"]["id"], "character": e["cue"]["character"],
+                 "text": e["cue"]["text"]} if e["cue"] else None),
+        "note": e["note"]["content"] if e["note"] else None,
+    } for e in entries]
+
+
+def confirmation_status(conn, name):
+    """汇总该角色的确认状态（基于当前数据库状态即时比对）。
+
+    confirmed: 当前所见内容与某次确认时完全一致（修订号可以更高——其他页面的
+               无关改动不影响确认）。
+    pending:   从未确认，或曾确认但本角色可见内容已变化。
+    角色当前没有台词时不在确认清单内（返回 None）。
+    """
+    current = character_fingerprint(conn, name)
+    if current is None:
+        return None
+    row = conn.execute(
+        "SELECT revision, confirmed_at, snapshot_json FROM confirmation WHERE character = ?",
+        (name,),
+    ).fetchone()
+    if row is None:
+        return {"character": name, "status": "pending",
+                "confirmedRevision": None, "confirmedAt": None, "snapshot": None}
+    snapshot = json.loads(row["snapshot_json"])
+    return {
+        "character": name,
+        "status": "confirmed" if snapshot == current else "pending",
+        "confirmedRevision": row["revision"],  # 最近一次确认时的修订（待确认时也展示）
+        "confirmedAt": row["confirmed_at"],
+        # 待确认时把确认时所见内容带给页面，便于逐条标出变化；已确认时无需重复下发
+        "snapshot": snapshot if snapshot != current else None,
+    }
+
+
+def all_confirmation_statuses(conn):
+    """确认清单：当前每个有台词角色的确认状态；没有台词时为空列表。"""
+    names = sorted({r["character"] for r in
+                    conn.execute("SELECT DISTINCT character FROM line")})
+    return [confirmation_status(conn, n) for n in names]
+
 
 
 # --------------------------------------------------------------------------- #
@@ -510,32 +620,65 @@ def create_app():
     @app.get("/api/characters/<path:name>")
     def get_character(name):
         conn = get_db()
-        rows = conn.execute(
-            "SELECT id, text, pos FROM line WHERE character = ? ORDER BY pos", (name,)
-        ).fetchall()
-        if not rows:
+        entries = character_entries(conn, name)
+        if entries is None:
             return jsonify({"error": "not_found",
                             "message": f"角色「{name}」在工作稿中没有台词"}), 404
-        entries = []
-        for r in rows:
-            cue = conn.execute(
-                "SELECT id, character, text FROM line WHERE pos < ? ORDER BY pos DESC LIMIT 1",
-                (r["pos"],),
-            ).fetchone()
-            note = conn.execute(
-                "SELECT content, updated_at FROM note WHERE line_id = ?", (r["id"],)
-            ).fetchone()
-            entries.append({
-                "lineId": r["id"],
-                "text": r["text"],
-                "cue": dict(cue) if cue else None,
-                "note": {"content": note["content"], "updatedAt": note["updated_at"]}
-                        if note else None,
-            })
         return jsonify({
             "character": name,
             "revision": int(get_meta(conn, "working_revision", "0")),
             "entries": entries,
+            "confirmation": confirmation_status(conn, name),
+        })
+
+    # ---- 角色确认：确认本角色页所见内容，须带页面所见修订号 ---- #
+    @app.post("/api/characters/<path:name>/confirmations")
+    def confirm_character(name):
+        conn = get_db()
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return bad_request("请求体必须是 JSON 对象")
+        rev = body.get("revision")
+        if not isinstance(rev, int) or isinstance(rev, bool):
+            return bad_request("revision 必须是整数（你所见的工作稿修订号）")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            current_rev = int(get_meta(conn, "working_revision", "0"))
+            if rev != current_rev:
+                conn.execute("ROLLBACK")
+                return jsonify({
+                    "error": "stale_revision", "type": "stale",
+                    "expected": current_rev, "received": rev,
+                    "message": f"工作稿已更新到修订 {current_rev}，确认整次拒绝，"
+                               "请刷新角色页按最新所见内容重新确认。",
+                }), 409
+            fp = character_fingerprint(conn, name)
+            if fp is None:
+                conn.execute("ROLLBACK")
+                return jsonify({"error": "not_found",
+                                "message": f"角色「{name}」在工作稿中没有台词，无法确认。"}), 404
+            now = utcnow()
+            conn.execute(
+                "INSERT INTO confirmation (character, revision, confirmed_at, snapshot_json) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(character) DO UPDATE SET revision = excluded.revision, "
+                "confirmed_at = excluded.confirmed_at, snapshot_json = excluded.snapshot_json",
+                (name, rev, now, json.dumps(fp, ensure_ascii=False)),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return jsonify({"character": name, "revision": rev, "confirmedAt": now,
+                        "status": "confirmed"}), 201
+
+    # ---- 确认清单：首页列出当前每个有台词角色的确认状态 ---- #
+    @app.get("/api/confirmations")
+    def list_confirmations():
+        conn = get_db()
+        return jsonify({
+            "revision": int(get_meta(conn, "working_revision", "0")),
+            "confirmations": all_confirmation_statuses(conn),
         })
 
     # ---- 笔记：保存在自己角色的台词上；同样要带所见修订号 ---- #
@@ -631,6 +774,19 @@ def create_app():
                 conn.execute("ROLLBACK")
                 return jsonify({"error": "already_published",
                                 "message": f"修订 {rev} 已发布过，请查看已发布版。"}), 422
+            # 同一数据库状态下核对所有当前角色的确认：有待确认角色则整次拒绝
+            # （发布行尚未插入，回滚后不会留下任何部分发布版）
+            pending = [c["character"] for c in all_confirmation_statuses(conn)
+                       if c["status"] != "confirmed"]
+            if pending:
+                conn.execute("ROLLBACK")
+                return jsonify({
+                    "error": "unconfirmed_characters",
+                    "message": "下列角色还没有确认自己角色页当前所见内容，发布整次拒绝，"
+                               "请逐个进入角色页确认后再发布：" +
+                               "、".join(f"「{c}」" for c in pending),
+                    "pendingCharacters": pending,
+                }), 422
             now = utcnow()
             conn.execute(
                 "INSERT INTO publication (revision, created_at, label) VALUES (?, ?, ?)",

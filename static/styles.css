@@ -104,8 +104,8 @@ button, .btn {
 }
 button:hover { border-color: var(--accent-dim); }
 button:disabled { opacity: .45; cursor: not-allowed; }
-button.primary { background: var(--accent); border-color: var(--accent); color: #201608; font-weight: 600; }
-button.primary:hover { background: #f0b75e; }
+button.primary, .btn.primary { background: var(--accent); border-color: var(--accent); color: #201608; font-weight: 600; }
+button.primary:hover, .btn.primary:hover { background: #f0b75e; }
 button.danger { color: var(--red); }
 button.ghost { background: transparent; }
 button.icon { padding: 3px 9px; font-size: 13px; }
@@ -150,6 +150,35 @@ input:focus, textarea:focus, select:focus {
 }
 .chip:hover { border-color: var(--blue); background: #1d2730; }
 .chip.work { color: var(--accent); border-color: var(--accent-dim); }
+.chip.work.ok { color: var(--green); border-color: #4f6b43; }
+.chip.work.ok:hover { border-color: var(--green); background: #1c2417; }
+.chip.work.pend { color: var(--red); border-color: #7a352b; text-decoration: none; }
+.chip.work.pend:hover { border-color: var(--red); background: #2c1a16; }
+
+/* 角色确认清单 */
+.conf-list li.pending { background: #2c1a16; border-radius: 8px; border-bottom: none; padding-left: 12px; padding-right: 12px; }
+.conf-dot {
+  display: inline-block;
+  width: 9px; height: 9px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+.conf-dot.ok { background: var(--green); }
+.conf-dot.pend { background: var(--red); }
+.conf-ok { color: var(--green); }
+.conf-pending { color: var(--red); }
+.diff-tag {
+  display: inline-block;
+  font-size: 11px;
+  color: var(--red);
+  border: 1px solid #7a352b;
+  background: #2c1a16;
+  border-radius: 4px;
+  padding: 0 5px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+.entry.has-diff { border-color: #7a352b; }
 
 .banner {
   border-radius: 8px;

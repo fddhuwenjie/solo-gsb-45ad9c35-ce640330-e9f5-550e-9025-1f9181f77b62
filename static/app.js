@@ -1,9 +1,9 @@
 /* 小剧场排练 · 剧本换版 —— 原生 JavaScript（无框架、无构建、无外部依赖）
  *
  * 路由（hash）：
- *   #/                      首页：工作稿概览 + 发布列表
+ *   #/                      首页：工作稿概览 + 角色确认清单 + 发布列表
  *   #/edit                 编辑工作稿（增删 / 改派 / 改词 / 重排，一次保存一个修订）
- *   #/role/:角色           角色页（提示 + 自己的台词笔记）
+ *   #/role/:角色           角色页（提示 + 自己的台词笔记 + 确认本页所见内容）
  *   #/pub/:rev             已发布版（全剧只读）
  *   #/pub/:rev/role/:角色  已发布版的角色页（冻结提示 + 冻结笔记）
  */
@@ -119,14 +119,41 @@ window.addEventListener("hashchange", navigate);
 
 // ---------------------------------------------------------------- 首页 ---- //
 async function renderHome() {
-  const [draft, pubs] = await Promise.all([
+  const [draft, pubs, confs] = await Promise.all([
     api("GET", "/api/draft"),
     api("GET", "/api/publications"),
+    api("GET", "/api/confirmations"),
   ]);
+  const confMap = new Map(confs.confirmations.map((c) => [c.character, c]));
+  const pendingChars = confs.confirmations.filter((c) => c.status === "pending");
   const charChips = draft.characters.length
-    ? draft.characters.map((c) =>
-        `<a class="chip work" href="#/role/${encodeURIComponent(c)}">${esc(c)}</a>`).join("")
-    : '<span class="muted small">（暂无角色）</span>';
+    ? draft.characters.map((c) => {
+        const cf = confMap.get(c);
+        const ok = cf && cf.status === "confirmed";
+        return `<a class="chip work ${ok ? "ok" : "pend"}"
+            href="#/role/${encodeURIComponent(c)}"
+            title="${ok ? "已确认确认时所见内容" : "有待确认内容，点击进入角色页"}">${
+            ok ? "✔ " : "⏳ "}${esc(c)}</a>`;
+      }).join("")
+    : '<span class="muted small">（暂无角色，没有需要确认的台词）</span>';
+
+  const confList = confs.confirmations.map((c) => {
+    const ok = c.status === "confirmed";
+    return `<li class="${ok ? "" : "pending"}">
+      <span class="conf-dot ${ok ? "ok" : "pend"}"></span>
+      <strong>${esc(c.character)}</strong>
+      <span class="muted small">${
+        ok
+          ? `已确认 r${c.confirmedRevision} 的所见内容 · ${fmtTime(c.confirmedAt)}`
+          : (c.confirmedRevision != null
+              ? `待确认：r${c.confirmedRevision} 确认过的内容已发生变化`
+              : "待确认：尚未确认过自己角色页的内容")
+      }</span>
+      <span class="spacer"></span>
+      <a class="btn ${ok ? "" : "primary"}"
+         href="#/role/${encodeURIComponent(c.character)}">${ok ? "打开角色页" : "去确认 →"}</a>
+    </li>`;
+  }).join("");
 
   const pubList = pubs.publications.map((p) => {
     const frozen = p.revision === pubs.workingRevision;
@@ -142,6 +169,7 @@ async function renderHome() {
   }).join("");
 
   const unpub = pubs.publications.some((p) => p.revision === pubs.workingRevision);
+  const canPublish = pendingChars.length === 0;
   appEl.innerHTML = `
     <h1>工作稿<span class="rev-badge">当前修订 r${draft.revision}</span></h1>
     <p class="muted">角色页只显示本角色的台词与每句紧前一句的提示；重排后提示自动重算，笔记始终跟随原台词编号。</p>
@@ -153,9 +181,29 @@ async function renderHome() {
           ${unpub ? "" : `<span class="rev-badge">有未发布改动</span>`}</div>
         <span class="spacer"></span>
         <a class="btn" href="#/edit">✎ 编辑工作稿</a>
-        <button class="primary" id="publish-btn">📷 发布当前修订 r${draft.revision}</button>
+        <button class="primary" id="publish-btn"
+          title="${canPublish ? "" : "有待确认角色，发布会被拒绝"}">
+          📷 发布当前修订 r${draft.revision}</button>
       </div>
       <div style="margin-top:12px">${charChips}</div>
+    </div>
+
+    <h2>角色确认清单</h2>
+    <div class="panel">
+      <p class="muted small">确认只覆盖该角色当时角色页所见的
+        <strong>台词编号与顺序、正文、紧前提示和笔记</strong>；
+        这些内容变化才会重新变为待确认，其他角色的无关改动不影响已确认状态。</p>
+      ${confList
+        ? `<ul class="vlist conf-list">${confList}</ul>`
+        : '<p class="muted small">当前没有台词，确认清单为空。</p>'}
+      ${pendingChars.length
+        ? `<div class="banner warn" style="margin-bottom:0">
+             <strong>有 ${pendingChars.length} 个角色待确认：</strong>
+             ${pendingChars.map((c) =>
+               `<a href="#/role/${encodeURIComponent(c.character)}">${esc(c.character)}</a>`).join("、")}
+             。有待确认角色时发布会被整次拒绝。
+           </div>`
+        : ""}
     </div>
 
     <h2>已发布版（冻结快照，旧版仍可打开）</h2>
@@ -164,6 +212,13 @@ async function renderHome() {
     </div>`;
 
   document.getElementById("publish-btn").addEventListener("click", async () => {
+    if (pendingChars.length) {
+      toast(`发布被拒绝：还有 ${pendingChars.length} 个角色待确认（${
+        pendingChars.map((c) => c.character).join("、")}）`, true);
+      const first = document.querySelector(".conf-list li.pending a.btn");
+      if (first) first.focus();
+      return;
+    }
     const label = prompt(`把当前工作稿修订 r${draft.revision} 冻结发布。\n可选：给这个版本起个名字（留空即可）：`, "");
     if (label === null) return;
     try {
@@ -171,7 +226,7 @@ async function renderHome() {
       toast(`已发布 r${p.revision}，所有角色页与笔记已冻结`);
       navigate();
     } catch (e) {
-      if (e.status === 409) {
+      if (e.status === 409 || e.status === 422) {
         toast(e.message, true);
         navigate();
       } else {
@@ -432,6 +487,29 @@ async function saveEditor(syncFn) {
 }
 
 // ---------------------------------------------------------------- 角色页 -- //
+// 待确认时，后端会带回「上次确认时所见」的快照，逐句标出当前页面与它的差异。
+function diffTagsFor(entry, snapEntry, snapList, prevIdNow) {
+  if (!snapList) return [];                  // 从未确认：没有对比基线
+  if (!snapEntry) return ["新增"];
+  const tags = [];
+  if (snapEntry.text !== entry.text) tags.push("正文已改");
+  const oldCue = snapEntry.cue, newCue = entry.cue;
+  const cueChanged =
+    (oldCue == null) !== (newCue == null) ||
+    (oldCue && (oldCue.id !== newCue.id || oldCue.character !== newCue.character ||
+                oldCue.text !== newCue.text));
+  if (cueChanged) tags.push("紧前提示已变");
+  const oldNote = snapEntry.note;
+  const newNote = entry.note ? entry.note.content : null;
+  if ((oldNote || null) !== (newNote || null)) {
+    tags.push(oldNote ? (newNote ? "笔记已改" : "笔记已清空") : "新增了笔记");
+  }
+  const i = snapList.indexOf(snapEntry);
+  const prevThen = i > 0 ? snapList[i - 1].lineId : null;
+  if (prevThen !== prevIdNow) tags.push("顺序已变");
+  return tags;
+}
+
 async function renderRole(name) {
   if (name === undefined || name === "") { appEl.innerHTML = '<p class="muted">缺少角色名。</p>'; return; }
   let data;
@@ -439,9 +517,23 @@ async function renderRole(name) {
     data = await api("GET", `/api/characters/${encodeURI(name)}`);
   } catch (e) { renderError(e); return; }
 
-  const entriesHtml = data.entries.map((en) => `
-    <div class="entry" data-id="${en.lineId}">
-      <div class="line-tag">#${en.lineId}</div>
+  const conf = data.confirmation || { status: "pending" };
+  const snapList = conf.snapshot || null;
+  const snapById = snapList ? new Map(snapList.map((s) => [s.lineId, s])) : null;
+  // 当前顺序中每句的前一句编号，用于判断「顺序已变」
+  const prevIdNow = new Map();
+  let prevId = null;
+  for (const en of data.entries) { prevIdNow.set(en.lineId, prevId); prevId = en.lineId; }
+
+  const entriesHtml = data.entries.map((en) => {
+    let tagsHtml = "";
+    if (snapById) {
+      const tags = diffTagsFor(en, snapById.get(en.lineId), snapList, prevIdNow.get(en.lineId));
+      if (tags.length) tagsHtml = tags.map((t) => `<span class="diff-tag">${esc(t)}</span>`).join("");
+    }
+    return `
+    <div class="entry ${tagsHtml ? "has-diff" : ""}" data-id="${en.lineId}">
+      <div class="line-tag">#${en.lineId}${tagsHtml}</div>
       ${en.cue
         ? `<p class="cue">紧前提示 · <span class="who">${esc(en.cue.character)}</span>
              <a class="link small" href="#/role/${encodeURIComponent(en.cue.character)}" title="打开该角色页">→</a>
@@ -458,15 +550,50 @@ async function renderRole(name) {
           <span class="note-meta spacer">${en.note ? "更新于 " + fmtTime(en.note.updatedAt) : "还没有笔记"}</span>
         </div>
       </div>
-    </div>`).join("");
+    </div>`;
+  }).join("");
+
+  let confBanner;
+  if (conf.status === "confirmed") {
+    confBanner = `<div class="banner info">
+      <strong>✔ 已确认</strong>：以上所见内容与 r${conf.confirmedRevision} 时确认的一致
+      （${fmtTime(conf.confirmedAt)}）。其他页面的无关改动不会改变本状态。</div>`;
+  } else if (conf.confirmedRevision != null) {
+    const removed = snapList ? snapList.filter((s) =>
+      !data.entries.some((en) => en.lineId === s.lineId)).map((s) => `#${s.lineId}`) : [];
+    confBanner = `<div class="banner warn">
+      <strong>⏳ 待确认</strong>：本角色页内容与 r${conf.confirmedRevision}
+      确认时已不同（差异见各条标记${removed.length ? `；确认时的 ${removed.join("、")} 已不在本角色页` : ""}）。
+      确认只对当前所见的 <strong>台词编号与顺序、正文、紧前提示和笔记</strong>有效，
+      核对无误后点下方「确认本页所见内容」。</div>`;
+  } else {
+    confBanner = `<div class="banner warn">
+      <strong>⏳ 待确认</strong>：你还没有确认过本角色页当前所见内容
+      （台词编号与顺序、正文、紧前提示、笔记）。核对无误后点下方按钮确认。</div>`;
+  }
 
   appEl.innerHTML = `
     <h1>角色页 · ${esc(name)}<span class="rev-badge">所见修订 r${data.revision}</span></h1>
     <p class="muted small">本页共 ${data.entries.length} 句。保存笔记会把工作稿推进一个修订；
-      若期间别人改了稿，保存会被拒绝并要求按新顺序刷新。
+      若期间别人改了稿，保存或确认会被拒绝并要求按新顺序刷新。
       发布后的冻结版见首页的已发布列表。</p>
-    <div id="role-banner"></div>
+    <div id="role-banner">${confBanner}</div>
+    <div class="row" style="margin:4px 0 10px">
+      <button class="primary" id="confirm-btn"
+        title="提交页面所见修订号 r${data.revision}；过期会被拒绝">
+        ✔ 确认本页所见内容（r${data.revision}）</button>
+      <span class="small ${conf.status === "confirmed" ? "conf-ok" : "conf-pending"}"
+        id="confirm-state">${
+        conf.status === "confirmed"
+          ? `当前状态：已确认 r${conf.confirmedRevision}`
+          : (conf.confirmedRevision != null
+              ? `当前状态：待确认（上次确认于 r${conf.confirmedRevision}）`
+              : "当前状态：待确认")
+      }</span>
+    </div>
     ${entriesHtml}`;
+
+  document.getElementById("confirm-btn").onclick = () => submitConfirmation(name, data.revision);
 
   appEl.querySelectorAll(".entry").forEach((box) => {
     const id = Number(box.dataset.id);
@@ -478,6 +605,26 @@ async function renderRole(name) {
       if (confirm("清空这句台词的笔记？")) submitNote(id, name, "", box, data.revision, true);
     };
   });
+}
+
+async function submitConfirmation(character, revision) {
+  const btn = document.getElementById("confirm-btn");
+  btn.disabled = true;
+  try {
+    await api("POST", `/api/characters/${encodeURI(character)}/confirmations`, { revision });
+    toast("已确认本页所见内容");
+    renderRole(parseHash()[1]);
+  } catch (e) {
+    btn.disabled = false;
+    if (e.status === 409) {
+      const banner = document.getElementById("role-banner");
+      banner.innerHTML = staleBanner(e) +
+        '<p class="small"><a class="link" href="" onclick="location.reload();return false;">刷新本页按最新内容重新确认</a></p>';
+      banner.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    } else {
+      toast(e.message, true);
+    }
+  }
 }
 
 async function submitNote(lineId, character, content, box, revision, isClear) {
