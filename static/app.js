@@ -128,6 +128,25 @@ async function renderHome() {
         `<a class="chip work" href="#/role/${encodeURIComponent(c)}">${esc(c)}</a>`).join("")
     : '<span class="muted small">（暂无角色）</span>';
 
+  // 角色确认状态：发布前每个有台词的角色都要在角色页确认所见内容
+  const confs = draft.confirmations || [];
+  const pendingCount = confs.filter((s) => !s.confirmed).length;
+  const confRows = confs.length
+    ? confs.map((s) => `
+      <li>
+        <a class="chip work" href="#/role/${encodeURIComponent(s.character)}">${esc(s.character)}</a>
+        ${s.confirmed
+          ? `<span class="conf-ok">✓ 已确认${s.confirmedAt ? " · " + fmtTime(s.confirmedAt) : ""}</span>`
+          : `<span class="conf-pending">● 待确认</span>
+             <a class="link small" href="#/role/${encodeURIComponent(s.character)}">去确认 →</a>`}
+      </li>`).join("")
+    : '<li class="muted small">（当前没有带台词的角色，确认清单为空）</li>';
+  const confBadge = confs.length
+    ? (pendingCount
+        ? `<span class="rev-badge">${pendingCount} 个角色待确认</span>`
+        : '<span class="rev-badge frozen">全部已确认</span>')
+    : "";
+
   const pubList = pubs.publications.map((p) => {
     const frozen = p.revision === pubs.workingRevision;
     return `<li>
@@ -145,6 +164,7 @@ async function renderHome() {
   appEl.innerHTML = `
     <h1>工作稿<span class="rev-badge">当前修订 r${draft.revision}</span></h1>
     <p class="muted">角色页只显示本角色的台词与每句紧前一句的提示；重排后提示自动重算，笔记始终跟随原台词编号。</p>
+    <div id="home-banner"></div>
 
     <div class="panel">
       <div class="row">
@@ -156,6 +176,13 @@ async function renderHome() {
         <button class="primary" id="publish-btn">📷 发布当前修订 r${draft.revision}</button>
       </div>
       <div style="margin-top:12px">${charChips}</div>
+    </div>
+
+    <h2>角色确认状态 ${confBadge}</h2>
+    <div class="panel">
+      <p class="muted small" style="margin-top:0">每个角色在各自角色页核对台词、紧前提示与笔记后点「确认」；
+        所见内容一旦有变即回到待确认。有待确认角色时无法发布。</p>
+      <ul class="vlist">${confRows}</ul>
     </div>
 
     <h2>已发布版（冻结快照，旧版仍可打开）</h2>
@@ -174,6 +201,13 @@ async function renderHome() {
       if (e.status === 409) {
         toast(e.message, true);
         navigate();
+      } else if (e.status === 422 && e.data && e.data.error === "unconfirmed") {
+        const lis = (e.data.characters || []).map((c) =>
+          `<li><a href="#/role/${encodeURIComponent(c)}">${esc(c)} 角色页</a> 去确认</li>`).join("");
+        document.getElementById("home-banner").innerHTML =
+          `<div class="banner error"><strong>发布被拒绝，未产生任何发布版。</strong>
+             ${esc(e.data.message || e.message)}<ul>${lis}</ul></div>`;
+        window.scrollTo({ top: 0, behavior: "smooth" });
       } else {
         toast(e.message, true);
       }
@@ -460,13 +494,44 @@ async function renderRole(name) {
       </div>
     </div>`).join("");
 
+  const conf = data.confirmation || { confirmed: false, confirmedAt: null };
   appEl.innerHTML = `
     <h1>角色页 · ${esc(name)}<span class="rev-badge">所见修订 r${data.revision}</span></h1>
     <p class="muted small">本页共 ${data.entries.length} 句。保存笔记会把工作稿推进一个修订；
       若期间别人改了稿，保存会被拒绝并要求按新顺序刷新。
       发布后的冻结版见首页的已发布列表。</p>
     <div id="role-banner"></div>
+    <div class="panel confirm-panel">
+      <div class="row">
+        ${conf.confirmed
+          ? `<span class="conf-ok">✓ 已确认当前所见内容${conf.confirmedAt ? "（" + fmtTime(conf.confirmedAt) + "）" : ""}</span>`
+          : '<span class="conf-pending">● 尚未确认当前所见内容</span>'}
+        <span class="spacer"></span>
+        <button class="primary" id="confirm-btn">✓ 确认我所见的台词、提示与笔记</button>
+      </div>
+      <p class="muted small" style="margin:8px 0 0">确认以本页当前展示（修订 r${data.revision}）的
+        台词编号与顺序、正文、紧前提示和笔记为准；这些内容一旦有变，确认自动失效，需重新确认。
+        其他角色的无关改动不影响本页确认状态。</p>
+    </div>
     ${entriesHtml}`;
+
+  document.getElementById("confirm-btn").onclick = async () => {
+    const banner = document.getElementById("role-banner");
+    try {
+      const res = await api("POST", `/api/characters/${encodeURI(name)}/confirm`,
+                            { revision: data.revision });
+      toast(`已确认 ${name} 的所见内容（r${res.revision}）`);
+      renderRole(parseHash()[1]);
+    } catch (e) {
+      if (e.status === 409) {
+        banner.innerHTML = staleBanner(e) +
+          '<p class="small"><a class="link" href="" onclick="location.reload();return false;">刷新本页核对最新内容后再确认</a></p>';
+        banner.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      } else {
+        toast(e.message, true);
+      }
+    }
+  };
 
   appEl.querySelectorAll(".entry").forEach((box) => {
     const id = Number(box.dataset.id);

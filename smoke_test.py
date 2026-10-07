@@ -174,6 +174,40 @@ resp = client.post("/api/draft", json={"revision": 7, "ops": [
 check("delete after note cleared 200", resp.status_code == 200, resp.get_json())
 check("rev -> 8", resp.get_json()["revision"] == 8)
 
+# 8.5 角色确认：发布前每个有台词的角色都要确认所见内容
+r = client.get("/api/draft").get_json()
+check("confirm list covers current characters",
+      {c["character"] for c in r["confirmations"]} == set(r["characters"])
+      and len(r["confirmations"]) == 4, r["confirmations"])
+check("all pending before any confirm",
+      all(not c["confirmed"] for c in r["confirmations"]))
+check("character page reports pending",
+      client.get("/api/characters/林晚").get_json()["confirmation"]["confirmed"] is False)
+
+# 有待确认角色：发布整次拒绝并列出角色，不留部分发布版
+resp = client.post("/api/publications", json={"revision": 8, "label": "不该成功"})
+check("publish with pending -> 422", resp.status_code == 422, resp.status_code)
+body = resp.get_json()
+check("unconfirmed error lists all characters",
+      body["error"] == "unconfirmed"
+      and set(body["characters"]) == set(r["characters"]), body)
+check("no partial publication left",
+      client.get("/api/publications/8").status_code == 404)
+
+# 确认必须带页面所见修订号：过期拒绝
+resp = client.post("/api/characters/林晚/confirm", json={"revision": 7})
+check("stale confirm -> 409", resp.status_code == 409, resp.status_code)
+
+# 逐个角色确认；确认不推进工作稿修订号，角色之间互不影响
+for name in r["characters"]:
+    resp = client.post(f"/api/characters/{name}/confirm", json={"revision": 8})
+    check(f"confirm {name} 200", resp.status_code == 200, resp.get_json())
+r = client.get("/api/draft").get_json()
+check("confirm does not bump revision", r["revision"] == 8, r["revision"])
+check("all confirmed", all(c["confirmed"] for c in r["confirmations"]))
+check("character page reports confirmed",
+      client.get("/api/characters/林晚").get_json()["confirmation"]["confirmed"] is True)
+
 # 9. 发布 r2（当前修订 8）；之后再改工作稿，r2 不变
 pub = client.post("/api/publications", json={"revision": 8, "label": "联排版"}).get_json()
 check("publish r8", pub["revision"] == 8)
@@ -202,10 +236,66 @@ r = client.get("/api/publications/1/characters/林晚").get_json()
 check("pub role page frozen notes",
       any(e["lineId"] == seed_ids[6] and e["note"] for e in r["entries"]))
 
+# 9.5 确认失效规则：只跟随「该角色可见内容」，无关改动不影响
+# rev9 在末尾加了旁白句：只有旁白自己的可见内容变了
+r = client.get("/api/draft").get_json()
+confs = {c["character"]: c["confirmed"] for c in r["confirmations"]}
+check("unrelated edit keeps confirmation",
+      confs["阿禾"] and confs["林晚"] and confs["老周"], confs)
+check("owner of new line back to pending", not confs["旁白"], confs)
+
+# 改老周 #5 的正文：老周（自己的台词）与阿禾（#6 的紧前提示是 #5）待确认；
+# 林晚所见内容未变，确认仍然有效
+resp = client.post("/api/draft", json={"revision": 9, "ops": [
+    {"cid": "t5", "type": "text", "target": {"type": "line", "id": seed_ids[4]},
+     "text": "都把绳子收了。今晚谁也不许单独下水——灯，也别去碰。"}]})
+check("text edit -> rev 10", resp.get_json()["revision"] == 10, resp.get_json())
+r = client.get("/api/draft").get_json()
+confs = {c["character"]: c["confirmed"] for c in r["confirmations"]}
+check("text change invalidates owner", not confs["老周"], confs)
+check("cue change invalidates listener", not confs["阿禾"], confs)
+check("bystander keeps confirmation", confs["林晚"], confs)
+
+# 笔记也是所见内容：给林晚的 #4 写笔记 → 林晚待确认；笔记不进入紧前提示，不波及他人
+resp = client.put(f"/api/lines/{seed_ids[3]}/note",
+                  json={"revision": 10, "character": "林晚", "content": "气口再慢一点"})
+check("note save -> rev 11", resp.get_json()["revision"] == 11, resp.get_json())
+r = client.get("/api/draft").get_json()
+confs = {c["character"]: c["confirmed"] for c in r["confirmations"]}
+check("note change invalidates owner", not confs["林晚"], confs)
+check("note change spares others",
+      confs["旁白"] is False and not confs["老周"] and not confs["阿禾"], confs)
+
+# 林晚按新修订重新确认后恢复已确认
+resp = client.post("/api/characters/林晚/confirm", json={"revision": 11})
+check("re-confirm 200", resp.status_code == 200, resp.get_json())
+r = client.get("/api/draft").get_json()
+confs = {c["character"]: c["confirmed"] for c in r["confirmations"]}
+check("re-confirm restores confirmed", confs["林晚"], confs)
+
+# 9.6 空工作稿：确认清单为空，可直接发布
+resp = client.put(f"/api/lines/{seed_ids[3]}/note",
+                  json={"revision": 11, "character": "林晚", "content": ""})
+check("clear note -> rev 12", resp.get_json()["revision"] == 12, resp.get_json())
+r = client.get("/api/draft").get_json()
+resp = client.post("/api/draft", json={"revision": 12, "ops": [
+    {"cid": f"d{i}", "type": "delete", "target": {"type": "line", "id": l["id"]}}
+    for i, l in enumerate(r["lines"])]})
+check("delete all lines 200", resp.status_code == 200, resp.get_json())
+check("rev -> 13", resp.get_json()["revision"] == 13, resp.get_json())
+r = client.get("/api/draft").get_json()
+check("empty draft has empty confirm list", r["confirmations"] == [])
+check("confirm on line-less character -> 404",
+      client.post("/api/characters/林晚/confirm",
+                  json={"revision": 13}).status_code == 404)
+pub = client.post("/api/publications", json={"revision": 13, "label": "空稿"}).get_json()
+check("publish empty draft ok", pub["revision"] == 13, pub)
+
 # 10. 列表汇总
 r = client.get("/api/publications").get_json()
-check("pub list r1,r8", [p["revision"] for p in r["publications"]] == [1, 8])
-check("working rev 9", r["workingRevision"] == 9)
+check("pub list r1,r8,r13",
+      [p["revision"] for p in r["publications"]] == [1, 8, 13])
+check("working rev 13", r["workingRevision"] == 13)
 
 # 11. 健康检查与首页
 check("healthz", client.get("/healthz").data == b"ok")
